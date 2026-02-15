@@ -1,0 +1,43 @@
+# OS files
+.DS_Store
+Thumbs.db
+db.json
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Dependencies
+node_modules/
+
+# Bun
+bun.lock
+.bun-build/
+
+# Build outputs
+dist/
+build/
+out/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+bun-debug.log*
+
+# Docker
+.docker/
+
+# Coverage
+coverage/
+.nyc_output/

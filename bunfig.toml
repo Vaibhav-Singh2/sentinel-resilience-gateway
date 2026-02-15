@@ -1,0 +1,10 @@
+# bunfig.toml
+[install]
+# set default registry
+# registry = "https://registry.npmjs.org"
+
+[test]
+# runner = "bun"
+
+[run]
+# main = "src/index.ts"
