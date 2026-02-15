@@ -65,8 +65,84 @@ export const redisLatencyHistogram = new client.Histogram({
   registers: [register],
 });
 
+export const pressureLocal = new client.Gauge({
+  name: "sentinel_pressure_local",
+  help: "Current local pressure score (0-1)",
+  registers: [register],
+});
+
+export const pressureGlobal = new client.Gauge({
+  name: "sentinel_pressure_global",
+  help: "Current global pressure score (0-1)",
+  registers: [register],
+});
+
+export const protectionModeMetric = new client.Gauge({
+  name: "sentinel_protection_mode",
+  help: "Current protection mode (0=NORMAL, 1=MODERATE, 2=AGGRESSIVE, 3=CRITICAL)",
+  registers: [register],
+});
+
+export const breakerStateMetric = new client.Gauge({
+  name: "sentinel_breaker_state",
+  help: "Circuit breaker state (0=CLOSED, 1=HALF_OPEN, 2=OPEN)",
+  labelNames: ["service"],
+  registers: [register],
+});
+
+export const breakerOpenTotal = new client.Counter({
+  name: "sentinel_breaker_open_total",
+  help: "Total number of times circuit breaker opened",
+  labelNames: ["service"],
+  registers: [register],
+});
+
+export const tenantRequestTotal = new client.Counter({
+  name: "sentinel_tenant_requests_total",
+  help: "Total requests per tenant plan",
+  labelNames: ["plan"],
+  registers: [register],
+});
+
+export const priorityDropsTotal = new client.Counter({
+  name: "sentinel_priority_drops_total",
+  help: "Total requests dropped due to priority scheduling",
+  labelNames: ["plan", "mode"],
+  registers: [register],
+});
+
+export const degradedResponseTotal = new client.Counter({
+  name: "sentinel_degraded_response_total",
+  help: "Total degraded responses served",
+  registers: [register],
+});
+
+export const premiumPreservedTotal = new client.Counter({
+  name: "sentinel_premium_preserved_total",
+  help: "Total premium requests preserved under pressure",
+  labelNames: ["tenant_id"],
+  registers: [register],
+});
+
+import { pressureMonitor } from "./pressure/pressureMonitor";
+import { globalPressure } from "./pressure/globalPressure";
+import { protectionPolicy, ProtectionMode } from "./pressure/protectionMode";
+
 export default async function metricsRoutes(fastify: FastifyInstance) {
   fastify.get("/metrics", async (req, reply) => {
+    // Update gauges
+    pressureLocal.set(pressureMonitor.getPressure());
+    pressureGlobal.set(globalPressure.getGlobalPressure());
+
+    const mode = protectionPolicy.getMode();
+    const modeValue = {
+      [ProtectionMode.NORMAL]: 0,
+      [ProtectionMode.MODERATE]: 1,
+      [ProtectionMode.AGGRESSIVE]: 2,
+      [ProtectionMode.CRITICAL]: 3,
+    }[mode];
+    protectionModeMetric.set(modeValue);
+
     reply.header("Content-Type", register.contentType);
     return register.metrics();
   });

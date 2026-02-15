@@ -11,6 +11,19 @@ export const config: AppConfig = {
   redisUrl: process.env.REDIS_URL || "redis://localhost:6379",
   windowMs: parseInt(process.env.WINDOW_MS || "60000", 10),
   baseRateLimit: parseInt(process.env.BASE_RATE_LIMIT || "100", 10),
+  podId: process.env.POD_ID || crypto.randomUUID(),
+  breakerFailureThreshold: parseFloat(
+    process.env.BREAKER_FAILURE_THRESHOLD || "0.5",
+  ),
+  breakerConsecutiveFailures: parseInt(
+    process.env.BREAKER_CONSECUTIVE_FAILURES || "10",
+    10,
+  ),
+  breakerCooldownMs: parseInt(process.env.BREAKER_COOLDOWN_MS || "30000", 10),
+  breakerHalfOpenMaxRequests: parseInt(
+    process.env.BREAKER_HALF_OPEN_MAX_REQUESTS || "5",
+    10,
+  ),
 };
 
 if (!process.env.DOWNSTREAM_URL) {

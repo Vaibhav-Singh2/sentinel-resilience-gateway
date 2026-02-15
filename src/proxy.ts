@@ -9,22 +9,41 @@ import {
   distributedAllowedTotal,
   distributedRejectedTotal,
   redisLatencyHistogram,
+  protectionModeMetric,
+  tenantRequestTotal,
+  priorityDropsTotal,
+  degradedResponseTotal,
+  premiumPreservedTotal,
 } from "./metrics";
 import { TokenBucket } from "./limiter/tokenBucket";
 import { distributedLimiter } from "./limiter/distributedLimiter";
+import { pressureMonitor } from "./pressure/pressureMonitor";
+import { protectionPolicy, ProtectionMode } from "./pressure/protectionMode";
+import { globalPressure } from "./pressure/globalPressure";
+import { circuitBreaker } from "./breaker/circuitBreaker";
+import {
+  getTenantPlan,
+  TenantPlan,
+  PLAN_MULTIPLIERS,
+} from "./scheduler/tenantPlan";
+import { priorityScheduler } from "./scheduler/priorityScheduler";
+import { isHeavyEndpoint, getDegradedResponse } from "./utils/degrade";
 
 const tokenBucket = new TokenBucket(config.burstCapacity, config.refillRate);
 
 export default async function proxyRoutes(fastify: FastifyInstance) {
   fastify.all("*", async (req: FastifyRequest, reply: FastifyReply) => {
-    // Avoid double-forwarding health/metrics if they matched earlier routes
-    // Fastify handles route order, but wildcard * catches everything not matched.
-    // Ensure this plugin is registered AFTER health/metrics.
+    // Report request to pressure monitor
+    pressureMonitor.reportRequest();
 
     const requestId = req.id;
     const method = req.method;
     const tenantId =
       (req.headers[config.tenantHeader] as string) || "anonymous";
+
+    // 0. Extract Tenant Plan
+    const plan = getTenantPlan(req.headers);
+    tenantRequestTotal.inc({ plan });
 
     // 1. Local Token Bucket Check (Fast Path)
     if (!tokenBucket.allow(tenantId)) {
@@ -43,9 +62,19 @@ export default async function proxyRoutes(fastify: FastifyInstance) {
 
     // 2. Distributed Rate Limit Check (Redis)
     const redisStart = performance.now();
+
+    // Calculate adaptive limit with Plan Multiplier
+    const currentGlobalPressure = globalPressure.getGlobalPressure();
+    const planMultiplier = PLAN_MULTIPLIERS[plan];
+    const adaptiveLimit = distributedLimiter.getAdaptiveLimit(
+      currentGlobalPressure,
+      planMultiplier,
+    );
+
     const allowedDistributed = await distributedLimiter.checkDistributedLimit(
       tenantId,
       requestId as string,
+      adaptiveLimit,
     );
     const redisDuration = performance.now() - redisStart;
     redisLatencyHistogram.observe({ operation: "check_limit" }, redisDuration);
@@ -56,8 +85,10 @@ export default async function proxyRoutes(fastify: FastifyInstance) {
           event: "distributed_rate_limit",
           tenantId,
           requestId,
-          limit: config.baseRateLimit,
+          limit: adaptiveLimit,
           windowMs: config.windowMs,
+          pressure: currentGlobalPressure,
+          plan,
         },
         "Rate limit exceeded (distributed)",
       );
@@ -70,9 +101,53 @@ export default async function proxyRoutes(fastify: FastifyInstance) {
 
     distributedAllowedTotal.inc({ tenant_id: tenantId });
 
+    // 3. Priority Scheduler & Protection Mode Check
+    if (!priorityScheduler.shouldAllow(tenantId, plan)) {
+      const mode = protectionPolicy.getMode();
+      priorityDropsTotal.inc({ plan, mode });
+      return reply
+        .code(503)
+        .send({ error: "load_shedding", reason: "priority_throttle", plan });
+    }
+
+    // 4. Circuit Breaker Check
+    // Service name defaults to hostname of downstream or fixed "default"
+    const serviceName = "backend-service";
+
+    if (!circuitBreaker.check(serviceName)) {
+      logger.warn(
+        { event: "circuit_breaker_open", serviceName, requestId },
+        "Circuit breaker open, blocking request",
+      );
+      return reply
+        .code(503)
+        .send({ error: "circuit_open", service: serviceName });
+    }
+
+    // 5. Protection Mode (Redundant block check is likely handled by Scheduler, but check Degraded Response)
+    if (
+      (protectionPolicy.getMode() === ProtectionMode.AGGRESSIVE ||
+        protectionPolicy.getMode() === ProtectionMode.CRITICAL) &&
+      isHeavyEndpoint(req.url)
+    ) {
+      logger.info(
+        { event: "degraded_response", requestId, url: req.url },
+        "Returning degraded response",
+      );
+      degradedResponseTotal.inc();
+      return reply.send(getDegradedResponse(req.url));
+    }
+
+    // Log Premium Preservation
+    if (plan === TenantPlan.PREMIUM && currentGlobalPressure > 0.7) {
+      premiumPreservedTotal.inc({ tenant_id: tenantId });
+      logger.debug(
+        { event: "premium_preserved", tenantId },
+        "Premium request preserved under pressure",
+      );
+    }
+
     // Construct downstream URL
-    // Remove query string from req.url because fetch handles it?
-    // req.url includes query string.
     const downstreamUrl = `${config.downstreamUrl}${req.url}`;
 
     logger.info(
@@ -119,20 +194,23 @@ export default async function proxyRoutes(fastify: FastifyInstance) {
       headers.delete("transfer-encoding");
 
       // Forward Request
-      // Use req.raw (Node stream) as body. Bun fetch handles this.
       const response = await fetch(downstreamUrl, {
         method,
         headers,
         body: method !== "GET" && method !== "HEAD" ? req.raw : undefined,
         signal: controller.signal,
-        // duplicate-duplex option might be needed for some node streams in Bun?
-        // Usually works out of box.
       } as any);
 
       clearTimeout(timeoutDesc);
 
       // Forward Response
       reply.code(response.status);
+
+      if (response.status >= 500) {
+        circuitBreaker.recordFailure("backend-service");
+      } else {
+        circuitBreaker.recordSuccess("backend-service");
+      }
 
       // Copy headers
       response.headers.forEach((value, key) => {
@@ -159,6 +237,7 @@ export default async function proxyRoutes(fastify: FastifyInstance) {
         if (reason === "Timeout") {
           logger.error({ requestId }, "Upstream timeout");
           requestTimeoutTotal.inc({ method });
+          circuitBreaker.recordFailure("backend-service");
           return reply.code(504).send({ error: "upstream_timeout" });
         } else if (reason === "ClientDisconnect") {
           // Already logged
@@ -167,6 +246,8 @@ export default async function proxyRoutes(fastify: FastifyInstance) {
       }
 
       logger.error({ requestId, err }, "Proxy error");
+      pressureMonitor.reportError();
+      circuitBreaker.recordFailure("backend-service");
       return reply.code(502).send({ error: "bad_gateway" });
     }
   });

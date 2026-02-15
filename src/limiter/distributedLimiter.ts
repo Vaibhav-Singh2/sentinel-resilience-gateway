@@ -50,10 +50,12 @@ export class DistributedLimiter {
   async checkDistributedLimit(
     tenantId: string,
     requestId: string,
+    uniqueLimit?: number,
   ): Promise<boolean> {
     const redis = getRedisClient();
     const key = `rate:${tenantId}`;
     const now = Date.now();
+    const limit = uniqueLimit || config.baseRateLimit;
 
     try {
       // @ts-ignore - checkSlidingWindow added via defineCommand
@@ -62,7 +64,7 @@ export class DistributedLimiter {
         config.windowMs,
         now,
         requestId,
-        config.baseRateLimit,
+        limit,
       );
 
       return result === 1;
@@ -73,6 +75,17 @@ export class DistributedLimiter {
       // Let's reject for safety as requested "Do NOT allow unlimited traffic if Redis is down."
       return false;
     }
+  }
+
+  public getAdaptiveLimit(
+    globalPressure: number,
+    planMultiplier: number = 1,
+  ): number {
+    // effectiveLimit = BASE_RATE_LIMIT * planMultiplier * (1 - globalPressure)
+    const limit = Math.floor(
+      config.baseRateLimit * planMultiplier * (1 - globalPressure),
+    );
+    return Math.max(1, limit); // Ensure at least 1 request allowed unless blocked by protection mode
   }
 }
 

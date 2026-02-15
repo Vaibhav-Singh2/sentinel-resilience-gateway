@@ -11,6 +11,11 @@ export interface AppConfig {
   redisUrl: string;
   windowMs: number;
   baseRateLimit: number;
+  podId?: string;
+  breakerFailureThreshold: number;
+  breakerConsecutiveFailures: number;
+  breakerCooldownMs: number;
+  breakerHalfOpenMaxRequests: number;
 }
 
 export interface ProxyRequestHeaders {
