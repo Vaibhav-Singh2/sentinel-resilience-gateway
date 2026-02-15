@@ -1,10 +1,15 @@
+import { initTracing, shutdownTracing } from "./observability/tracing";
+
+// Initialize tracing before anything else
+initTracing();
+
 import fastify from "fastify";
 import { config } from "./config";
 import { logger } from "./logger";
 import healthRoutes from "./health";
 import metricsRoutes from "./metrics";
 import proxyRoutes from "./proxy";
-import { requestTotal } from "./metrics";
+import { httpRequestsTotal } from "./metrics";
 import { randomUUID } from "crypto";
 
 const server = fastify({
@@ -25,7 +30,7 @@ server.addHook("onResponse", async (req, reply) => {
   const statusCode = reply.statusCode;
 
   // Increment total requests
-  requestTotal.inc({
+  httpRequestsTotal.inc({
     method: req.method,
     route: req.routeOptions.url || req.url, // Try to get matched route path if available, or fallback to url
     status_code: statusCode,
@@ -62,14 +67,16 @@ const start = async () => {
     for (const signal of signals) {
       process.on(signal, () => {
         logger.info({ signal }, "Shutting down...");
-        server.close().then(() => {
+        server.close().then(async () => {
           logger.info("Server closed");
+          await shutdownTracing();
           process.exit(0);
         });
       });
     }
   } catch (err) {
     logger.error({ err }, "Failed to start server");
+    await shutdownTracing();
     process.exit(1);
   }
 };

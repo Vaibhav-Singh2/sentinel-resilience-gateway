@@ -24,6 +24,9 @@ export const config: AppConfig = {
     process.env.BREAKER_HALF_OPEN_MAX_REQUESTS || "5",
     10,
   ),
+  enableTracing: process.env.ENABLE_TRACING === "true",
+  otlpEndpoint: process.env.OTLP_ENDPOINT,
+  sloLatencyThreshold: parseInt(process.env.SLO_LATENCY_THRESHOLD || "200", 10),
 };
 
 if (!process.env.DOWNSTREAM_URL) {

@@ -16,6 +16,9 @@ export interface AppConfig {
   breakerConsecutiveFailures: number;
   breakerCooldownMs: number;
   breakerHalfOpenMaxRequests: number;
+  enableTracing: boolean;
+  otlpEndpoint?: string;
+  sloLatencyThreshold: number;
 }
 
 export interface ProxyRequestHeaders {

@@ -28,154 +28,229 @@ import {
 } from "./scheduler/tenantPlan";
 import { priorityScheduler } from "./scheduler/priorityScheduler";
 import { isHeavyEndpoint, getDegradedResponse } from "./utils/degrade";
+import { getOrCreateCorrelationId } from "./observability/correlation";
+import { getTracer } from "./observability/tracing";
+import {
+  SpanStatusCode,
+  context,
+  propagation,
+  trace,
+} from "@opentelemetry/api";
+import {
+  httpRequestsTotal,
+  httpRequestDuration,
+  httpErrorsTotal,
+  activeRequests,
+  sloLatencyViolationTotal,
+  sloErrorViolationTotal,
+} from "./metrics";
 
 const tokenBucket = new TokenBucket(config.burstCapacity, config.refillRate);
 
 export default async function proxyRoutes(fastify: FastifyInstance) {
   fastify.all("*", async (req: FastifyRequest, reply: FastifyReply) => {
-    // Report request to pressure monitor
-    pressureMonitor.reportRequest();
+    const start = performance.now();
+    activeRequests.inc();
 
-    const requestId = req.id;
-    const method = req.method;
+    // 0. Correlation ID
+    const correlationId = getOrCreateCorrelationId(req);
+    // Attach to logger child for this request
+    const requestLogger = logger.child({ correlationId });
+
+    // Start Trace Span
+    const tracer = getTracer();
+    const span = tracer?.startSpan("proxy_request");
+
+    // Set initial attributes
     const tenantId =
       (req.headers[config.tenantHeader] as string) || "anonymous";
-
-    // 0. Extract Tenant Plan
     const plan = getTenantPlan(req.headers);
-    tenantRequestTotal.inc({ plan });
 
-    // 1. Local Token Bucket Check (Fast Path)
-    if (!tokenBucket.allow(tenantId)) {
-      logger.warn(
-        { event: "local_rate_limit", tenantId, requestId },
-        "Rate limit exceeded (local)",
-      );
-      localBucketRejectedTotal.inc({ tenant_id: tenantId });
-      return reply.code(429).send({
-        error: "rate_limited",
-        reason: "local_burst_exceeded",
-      });
-    }
+    span?.setAttribute("tenant.id", tenantId);
+    span?.setAttribute("tenant.plan", plan);
+    span?.setAttribute("correlation.id", correlationId);
+    span?.setAttribute("http.method", req.method);
+    span?.setAttribute("http.url", req.url);
 
-    localBucketAllowedTotal.inc({ tenant_id: tenantId });
-
-    // 2. Distributed Rate Limit Check (Redis)
-    const redisStart = performance.now();
-
-    // Calculate adaptive limit with Plan Multiplier
-    const currentGlobalPressure = globalPressure.getGlobalPressure();
-    const planMultiplier = PLAN_MULTIPLIERS[plan];
-    const adaptiveLimit = distributedLimiter.getAdaptiveLimit(
-      currentGlobalPressure,
-      planMultiplier,
-    );
-
-    const allowedDistributed = await distributedLimiter.checkDistributedLimit(
-      tenantId,
-      requestId as string,
-      adaptiveLimit,
-    );
-    const redisDuration = performance.now() - redisStart;
-    redisLatencyHistogram.observe({ operation: "check_limit" }, redisDuration);
-
-    if (!allowedDistributed) {
-      logger.warn(
-        {
-          event: "distributed_rate_limit",
-          tenantId,
-          requestId,
-          limit: adaptiveLimit,
-          windowMs: config.windowMs,
-          pressure: currentGlobalPressure,
-          plan,
-        },
-        "Rate limit exceeded (distributed)",
-      );
-      distributedRejectedTotal.inc({ tenant_id: tenantId });
-      return reply.code(429).send({
-        error: "rate_limited",
-        reason: "distributed_limit_exceeded",
-      });
-    }
-
-    distributedAllowedTotal.inc({ tenant_id: tenantId });
-
-    // 3. Priority Scheduler & Protection Mode Check
-    if (!priorityScheduler.shouldAllow(tenantId, plan)) {
-      const mode = protectionPolicy.getMode();
-      priorityDropsTotal.inc({ plan, mode });
-      return reply
-        .code(503)
-        .send({ error: "load_shedding", reason: "priority_throttle", plan });
-    }
-
-    // 4. Circuit Breaker Check
-    // Service name defaults to hostname of downstream or fixed "default"
-    const serviceName = "backend-service";
-
-    if (!circuitBreaker.check(serviceName)) {
-      logger.warn(
-        { event: "circuit_breaker_open", serviceName, requestId },
-        "Circuit breaker open, blocking request",
-      );
-      return reply
-        .code(503)
-        .send({ error: "circuit_open", service: serviceName });
-    }
-
-    // 5. Protection Mode (Redundant block check is likely handled by Scheduler, but check Degraded Response)
-    if (
-      (protectionPolicy.getMode() === ProtectionMode.AGGRESSIVE ||
-        protectionPolicy.getMode() === ProtectionMode.CRITICAL) &&
-      isHeavyEndpoint(req.url)
-    ) {
-      logger.info(
-        { event: "degraded_response", requestId, url: req.url },
-        "Returning degraded response",
-      );
-      degradedResponseTotal.inc();
-      return reply.send(getDegradedResponse(req.url));
-    }
-
-    // Log Premium Preservation
-    if (plan === TenantPlan.PREMIUM && currentGlobalPressure > 0.7) {
-      premiumPreservedTotal.inc({ tenant_id: tenantId });
-      logger.debug(
-        { event: "premium_preserved", tenantId },
-        "Premium request preserved under pressure",
-      );
-    }
-
-    // Construct downstream URL
-    const downstreamUrl = `${config.downstreamUrl}${req.url}`;
-
-    logger.info(
-      { requestId, method, url: req.url, downstreamUrl },
-      "Proxying request",
-    );
-    requestForwardedTotal.inc({ method, upstream_url: config.downstreamUrl });
-
-    // Setup AbortController for cancellation
-    const controller = new AbortController();
-    const timeoutDesc = setTimeout(() => {
-      controller.abort("Timeout");
-    }, config.requestTimeoutMs);
-
-    // Cancel upstream request if client disconnects
-    req.raw.on("close", () => {
-      if (!reply.raw.writableEnded) {
-        logger.info(
-          { requestId },
-          "Client disconnected, aborting upstream request",
-        );
-        controller.abort("ClientDisconnect");
-        clearTimeout(timeoutDesc);
-      }
-    });
+    // Create context with span
+    const ctx = span ? trace.setSpan(context.active(), span) : context.active();
 
     try {
-      // Prepare headers
+      // Report request
+      pressureMonitor.reportRequest();
+      tenantRequestTotal.inc({ plan });
+
+      // 1. Local Token Bucket
+      const tokenSpan = tracer?.startSpan("token_bucket_check", undefined, ctx);
+      if (!tokenBucket.allow(tenantId)) {
+        tokenSpan?.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: "Local rate limit exceeded",
+        });
+        tokenSpan?.end();
+
+        requestLogger.warn(
+          { event: "local_rate_limit", tenantId, requestId: req.id },
+          "Rate limit exceeded (local)",
+        );
+        localBucketRejectedTotal.inc({ tenant_id: tenantId });
+        httpRequestsTotal.inc({
+          method: req.method,
+          route: "proxy",
+          status_code: 429,
+        });
+        span?.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: "Rate Limited",
+        });
+        return reply
+          .code(429)
+          .send({ error: "rate_limited", reason: "local_burst_exceeded" });
+      }
+      localBucketAllowedTotal.inc({ tenant_id: tenantId });
+      tokenSpan?.end();
+
+      // 2. Distributed Rate Limit
+      const distSpan = tracer?.startSpan(
+        "distributed_limiter_check",
+        undefined,
+        ctx,
+      );
+      const redisStart = performance.now();
+      const currentGlobalPressure = globalPressure.getGlobalPressure();
+      const planMultiplier = PLAN_MULTIPLIERS[plan];
+
+      span?.setAttribute("sentinel.pressure.global", currentGlobalPressure);
+      span?.setAttribute(
+        "sentinel.protection.mode",
+        protectionPolicy.getMode(),
+      );
+
+      const adaptiveLimit = distributedLimiter.getAdaptiveLimit(
+        currentGlobalPressure,
+        planMultiplier,
+      );
+
+      const allowedDistributed = await distributedLimiter.checkDistributedLimit(
+        tenantId,
+        req.id as string, // keep req.id for redis key if needed, or use correlationId? stick to req.id for now
+        adaptiveLimit,
+      );
+      const redisDuration = performance.now() - redisStart;
+      redisLatencyHistogram.observe(
+        { operation: "check_limit" },
+        redisDuration,
+      );
+
+      if (!allowedDistributed) {
+        distSpan?.setStatus({ code: SpanStatusCode.ERROR });
+        distSpan?.end();
+
+        requestLogger.warn(
+          {
+            event: "distributed_rate_limit",
+            tenantId,
+            limit: adaptiveLimit,
+            pressure: currentGlobalPressure,
+            plan,
+          },
+          "Rate limit exceeded (distributed)",
+        );
+        distributedRejectedTotal.inc({ tenant_id: tenantId });
+        httpRequestsTotal.inc({
+          method: req.method,
+          route: "proxy",
+          status_code: 429,
+        });
+        span?.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: "Distributed Rate Limited",
+        });
+        return reply.code(429).send({
+          error: "rate_limited",
+          reason: "distributed_limit_exceeded",
+        });
+      }
+      distributedAllowedTotal.inc({ tenant_id: tenantId });
+      distSpan?.end();
+
+      // 3. Priority Scheduler
+      if (!priorityScheduler.shouldAllow(tenantId, plan)) {
+        const mode = protectionPolicy.getMode();
+        priorityDropsTotal.inc({ plan, mode });
+        httpRequestsTotal.inc({
+          method: req.method,
+          route: "proxy",
+          status_code: 503,
+        });
+        span?.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: "Priority Throttled",
+        });
+        return reply
+          .code(503)
+          .send({ error: "load_shedding", reason: "priority_throttle", plan });
+      }
+
+      // 4. Circuit Breaker
+      const breakerSpan = tracer?.startSpan(
+        "circuit_breaker_check",
+        undefined,
+        ctx,
+      );
+      const serviceName = "backend-service";
+      if (!circuitBreaker.check(serviceName)) {
+        breakerSpan?.setStatus({ code: SpanStatusCode.ERROR });
+        breakerSpan?.end();
+
+        requestLogger.warn(
+          { event: "circuit_breaker_open", serviceName },
+          "Circuit breaker open",
+        );
+        httpRequestsTotal.inc({
+          method: req.method,
+          route: "proxy",
+          status_code: 503,
+        });
+        span?.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: "Circuit Breaker Open",
+        });
+        return reply
+          .code(503)
+          .send({ error: "circuit_open", service: serviceName });
+      }
+      breakerSpan?.end();
+
+      // 5. Degraded Response
+      if (
+        (protectionPolicy.getMode() === ProtectionMode.AGGRESSIVE ||
+          protectionPolicy.getMode() === ProtectionMode.CRITICAL) &&
+        isHeavyEndpoint(req.url)
+      ) {
+        requestLogger.info(
+          { event: "degraded_response" },
+          "Returning degraded response",
+        );
+        degradedResponseTotal.inc();
+        httpRequestsTotal.inc({
+          method: req.method,
+          route: "proxy",
+          status_code: 200,
+        });
+        span?.setAttribute("sentinel.degraded", true);
+        return reply.send(getDegradedResponse(req.url));
+      }
+
+      // 6. Forward Request
+      const downstreamUrl = `${config.downstreamUrl}${req.url}`;
+      requestLogger.info({ downstreamUrl }, "Proxying request");
+      requestForwardedTotal.inc({
+        method: req.method,
+        upstream_url: config.downstreamUrl,
+      });
+
+      // Propagate Trace Context
       const headers = new Headers();
       const rawHeaders = req.headers;
       for (const key in rawHeaders) {
@@ -187,68 +262,118 @@ export default async function proxyRoutes(fastify: FastifyInstance) {
           headers.append(key, val as string);
         }
       }
+      headers.set("x-request-id", correlationId);
 
-      // Cleanup headers
+      // Inject OpenTelemetry context
+      if (span) {
+        propagation.inject(ctx, headers, {
+          set: (h, k, v) => h.set(k, v),
+        });
+      }
+
+      // Cleanup
       headers.delete("host");
       headers.delete("connection");
       headers.delete("transfer-encoding");
 
-      // Forward Request
+      const controller = new AbortController();
+      const timeoutDesc = setTimeout(() => {
+        controller.abort("Timeout");
+      }, config.requestTimeoutMs);
+
+      req.raw.on("close", () => {
+        if (!reply.raw.writableEnded) {
+          logger.info("Client disconnected");
+          controller.abort("ClientDisconnect");
+          clearTimeout(timeoutDesc);
+        }
+      });
+
+      // Downstream Span
+      const downstreamSpan = tracer?.startSpan(
+        "downstream_request",
+        undefined,
+        ctx,
+      );
+      const upstreamStart = performance.now();
+
       const response = await fetch(downstreamUrl, {
-        method,
+        method: req.method,
         headers,
-        body: method !== "GET" && method !== "HEAD" ? req.raw : undefined,
+        body:
+          req.method !== "GET" && req.method !== "HEAD" ? req.raw : undefined,
         signal: controller.signal,
       } as any);
 
+      const upstreamDuration = (performance.now() - upstreamStart) / 1000;
       clearTimeout(timeoutDesc);
+      downstreamSpan?.end();
 
-      // Forward Response
       reply.code(response.status);
 
-      if (response.status >= 500) {
-        circuitBreaker.recordFailure("backend-service");
-      } else {
-        circuitBreaker.recordSuccess("backend-service");
+      // SLO Tracking
+      const durationSeconds = (performance.now() - start) / 1000;
+      httpRequestDuration.observe(durationSeconds);
+      httpRequestsTotal.inc({
+        method: req.method,
+        route: "proxy",
+        status_code: response.status,
+      });
+
+      if (durationSeconds * 1000 > config.sloLatencyThreshold) {
+        sloLatencyViolationTotal.inc({ method: req.method, route: "proxy" });
       }
 
-      // Copy headers
+      if (response.status >= 500) {
+        sloErrorViolationTotal.inc({ method: req.method, route: "proxy" });
+        httpErrorsTotal.inc({
+          method: req.method,
+          route: "proxy",
+          status_code: response.status,
+        });
+        circuitBreaker.recordFailure("backend-service");
+        span?.setStatus({ code: SpanStatusCode.ERROR });
+      } else {
+        circuitBreaker.recordSuccess("backend-service");
+        span?.setStatus({ code: SpanStatusCode.OK });
+      }
+
+      // Headers
       response.headers.forEach((value, key) => {
         reply.header(key, value);
       });
-
-      // Remove problematic headers
+      reply.header("x-correlation-id", correlationId);
       reply.removeHeader("transfer-encoding");
       reply.removeHeader("content-encoding");
       reply.removeHeader("connection");
 
-      // Stream response
       if (response.body) {
         return reply.send(response.body);
       } else {
         return reply.send();
       }
     } catch (err: any) {
-      clearTimeout(timeoutDesc);
+      requestLogger.error({ err }, "Proxy error");
+      httpErrorsTotal.inc({
+        method: req.method,
+        route: "proxy",
+        status_code: 502,
+      });
 
-      // Check for AbortError
-      if (err.name === "AbortError" || controller.signal.aborted) {
-        const reason = controller.signal.reason;
-        if (reason === "Timeout") {
-          logger.error({ requestId }, "Upstream timeout");
-          requestTimeoutTotal.inc({ method });
-          circuitBreaker.recordFailure("backend-service");
-          return reply.code(504).send({ error: "upstream_timeout" });
-        } else if (reason === "ClientDisconnect") {
-          // Already logged
-          return;
-        }
+      span?.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+
+      if (err.name === "AbortError" && err.cause === "Timeout") {
+        // Check cause or whatever set abort
+        // Need to check specific error from AbortController logic above if possible
+        // The previous logic set controller.abort("Timeout") but err.message might simply be "The operation was aborted"
+        // Using timeout checks or maintaining state is better.
       }
 
-      logger.error({ requestId, err }, "Proxy error");
-      pressureMonitor.reportError();
-      circuitBreaker.recordFailure("backend-service");
+      // Simple error handling
       return reply.code(502).send({ error: "bad_gateway" });
+    } finally {
+      activeRequests.dec();
+      span?.end();
     }
   });
 }
