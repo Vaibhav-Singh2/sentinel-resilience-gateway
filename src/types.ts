@@ -8,6 +8,9 @@ export interface AppConfig {
   tenantHeader: string;
   burstCapacity: number;
   refillRate: number;
+  redisUrl: string;
+  windowMs: number;
+  baseRateLimit: number;
 }
 
 export interface ProxyRequestHeaders {

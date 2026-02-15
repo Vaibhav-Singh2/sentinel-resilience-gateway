@@ -1,7 +1,19 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { config } from "./config";
 import { logger } from "./logger";
-import { requestForwardedTotal, requestTimeoutTotal } from "./metrics";
+import {
+  requestForwardedTotal,
+  requestTimeoutTotal,
+  localBucketAllowedTotal,
+  localBucketRejectedTotal,
+  distributedAllowedTotal,
+  distributedRejectedTotal,
+  redisLatencyHistogram,
+} from "./metrics";
+import { TokenBucket } from "./limiter/tokenBucket";
+import { distributedLimiter } from "./limiter/distributedLimiter";
+
+const tokenBucket = new TokenBucket(config.burstCapacity, config.refillRate);
 
 export default async function proxyRoutes(fastify: FastifyInstance) {
   fastify.all("*", async (req: FastifyRequest, reply: FastifyReply) => {
@@ -11,6 +23,52 @@ export default async function proxyRoutes(fastify: FastifyInstance) {
 
     const requestId = req.id;
     const method = req.method;
+    const tenantId =
+      (req.headers[config.tenantHeader] as string) || "anonymous";
+
+    // 1. Local Token Bucket Check (Fast Path)
+    if (!tokenBucket.allow(tenantId)) {
+      logger.warn(
+        { event: "local_rate_limit", tenantId, requestId },
+        "Rate limit exceeded (local)",
+      );
+      localBucketRejectedTotal.inc({ tenant_id: tenantId });
+      return reply.code(429).send({
+        error: "rate_limited",
+        reason: "local_burst_exceeded",
+      });
+    }
+
+    localBucketAllowedTotal.inc({ tenant_id: tenantId });
+
+    // 2. Distributed Rate Limit Check (Redis)
+    const redisStart = performance.now();
+    const allowedDistributed = await distributedLimiter.checkDistributedLimit(
+      tenantId,
+      requestId as string,
+    );
+    const redisDuration = performance.now() - redisStart;
+    redisLatencyHistogram.observe({ operation: "check_limit" }, redisDuration);
+
+    if (!allowedDistributed) {
+      logger.warn(
+        {
+          event: "distributed_rate_limit",
+          tenantId,
+          requestId,
+          limit: config.baseRateLimit,
+          windowMs: config.windowMs,
+        },
+        "Rate limit exceeded (distributed)",
+      );
+      distributedRejectedTotal.inc({ tenant_id: tenantId });
+      return reply.code(429).send({
+        error: "rate_limited",
+        reason: "distributed_limit_exceeded",
+      });
+    }
+
+    distributedAllowedTotal.inc({ tenant_id: tenantId });
 
     // Construct downstream URL
     // Remove query string from req.url because fetch handles it?

@@ -8,6 +8,9 @@ export const config: AppConfig = {
   tenantHeader: process.env.TENANT_HEADER || "x-tenant-id",
   burstCapacity: parseInt(process.env.BURST_CAPACITY || "20", 10),
   refillRate: parseInt(process.env.REFILL_RATE || "10", 10),
+  redisUrl: process.env.REDIS_URL || "redis://localhost:6379",
+  windowMs: parseInt(process.env.WINDOW_MS || "60000", 10),
+  baseRateLimit: parseInt(process.env.BASE_RATE_LIMIT || "100", 10),
 };
 
 if (!process.env.DOWNSTREAM_URL) {
