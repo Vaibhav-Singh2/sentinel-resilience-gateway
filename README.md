@@ -213,3 +213,7 @@ bun run scripts/benchmark.ts
 ```
 
 _Note: Enable `LOG_LEVEL=error` or `warn` during benchmarks to avoid logging overhead._
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
