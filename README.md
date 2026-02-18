@@ -203,3 +203,13 @@ _(Note: Implementation logic for mapping tenants to plans is located in `src/sch
 - **Response Headers**:
   - `x-correlation-id`: Unique request ID.
   - `x-ratelimit-remaining`: Remaining requests in window.
+
+## Benchmarking
+
+To test the performance of the proxy, you can run the included benchmark script (uses `autocannon`).
+
+```bash
+bun run scripts/benchmark.ts
+```
+
+_Note: Enable `LOG_LEVEL=error` or `warn` during benchmarks to avoid logging overhead._
