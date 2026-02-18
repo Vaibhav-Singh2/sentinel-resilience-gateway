@@ -27,12 +27,12 @@ graph TD
     LoadBalancer --> Sentinel[Sentinel Proxy]
 
     subgraph "Sentinel Internal Flow"
-        Sentinel --> Correlation[1. Add Correlation ID]
-        Correlation --> LocalLimit[2. Local Token Bucket]
-        LocalLimit --> DistLimit[3. Distributed Rate Limit (Redis)]
-        DistLimit --> Pressure[4. Adaptive Pressure Check]
-        Pressure --> Priority[5. Priority Scheduler]
-        Priority --> Breaker[6. Circuit Breaker]
+        Sentinel --> Correlation["1. Add Correlation ID"]
+        Correlation --> LocalLimit["2. Local Token Bucket"]
+        LocalLimit --> DistLimit["3. Distributed Rate Limit (Redis)"]
+        DistLimit --> Pressure["4. Adaptive Pressure Check"]
+        Pressure --> Priority["5. Priority Scheduler"]
+        Priority --> Breaker["6. Circuit Breaker"]
     end
 
     Breaker -->|Allowed| Downstream[Backend Service]
