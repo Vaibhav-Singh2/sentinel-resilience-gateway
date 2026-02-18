@@ -1,0 +1,45 @@
+services:
+  sentinel:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - DOWNSTREAM_URL=http://mock-backend:80
+      - REDIS_URL=redis://redis:6379
+      - ENABLE_TRACING=true
+      - OTLP_ENDPOINT=http://jaeger:4318/v1/traces
+      - LOG_LEVEL=info
+      - SLO_LATENCY_THRESHOLD=200
+    depends_on:
+      - redis
+      - jaeger
+      - mock-backend
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+
+  mock-backend:
+    image: traefik/whoami
+    ports:
+      - "8080:80"
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686" # UI
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml

@@ -3,6 +3,7 @@ import {
   SimpleSpanProcessor,
   BatchSpanProcessor,
   ConsoleSpanExporter,
+  SpanProcessor,
 } from "@opentelemetry/sdk-trace-base";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
@@ -24,24 +25,24 @@ export function initTracing() {
     "pod.id": config.podId,
   });
 
-  tracerProvider = new NodeTracerProvider({
-    resource: resource,
-  });
+  const spanProcessors: SpanProcessor[] = [];
 
   if (config.otlpEndpoint) {
     const exporter = new OTLPTraceExporter({
       url: config.otlpEndpoint,
     });
-    // Cast to any because addSpanProcessor might be missing in some type defs or protected
-    (tracerProvider as any).addSpanProcessor(new BatchSpanProcessor(exporter));
+    spanProcessors.push(new BatchSpanProcessor(exporter));
     logger.info({ endpoint: config.otlpEndpoint }, "Initialized OTLP tracing");
   } else {
     // Default to console in dev/test if no endpoint
-    (tracerProvider as any).addSpanProcessor(
-      new SimpleSpanProcessor(new ConsoleSpanExporter()),
-    );
+    spanProcessors.push(new SimpleSpanProcessor(new ConsoleSpanExporter()));
     logger.info("Initialized Console tracing");
   }
+
+  tracerProvider = new NodeTracerProvider({
+    resource: resource,
+    spanProcessors: spanProcessors,
+  });
 
   tracerProvider.register();
   tracer = trace.getTracer("sentinel-proxy");

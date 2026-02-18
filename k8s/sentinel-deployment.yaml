@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel
+  labels:
+    app: sentinel
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: sentinel
+  template:
+    metadata:
+      labels:
+        app: sentinel
+    spec:
+      containers:
+        - name: sentinel
+          image: sentinel-proxy:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 3000
+          env:
+            - name: PORT
+              value: "3000"
+            - name: DOWNSTREAM_URL
+              value: "http://mock-backend" # Replace with actual downstream service
+            - name: REDIS_URL
+              value: "redis://redis:6379"
+            - name: LOG_LEVEL
+              value: "info"
+            - name: ENABLE_TRACING
+              value: "true"
+            - name: OTLP_ENDPOINT
+              value: "http://jaeger-collector:4318/v1/traces" # Example OTLP endpoint
+            - name: POD_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          resources:
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 5
