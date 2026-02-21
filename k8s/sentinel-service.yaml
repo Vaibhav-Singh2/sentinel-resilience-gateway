@@ -6,7 +6,9 @@ spec:
   selector:
     app: sentinel
   ports:
-    - protocol: TCP
-      port: 80
-      targetPort: 3000
-  type: LoadBalancer
+    - name: http
+      protocol: TCP
+      port: 80 # Service port (cluster-internal)
+      targetPort: 3000 # Container port
+      nodePort: 30300 # Accessible on localhost:30300 from host
+  type: NodePort

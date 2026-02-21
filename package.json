@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "bun run --watch src/index.ts",
     "start": "bun run src/index.ts",
-    "build": "bun build src/index.ts --outdir ./dist --target bun"
+    "build": "bun build src/index.ts --outdir ./dist --target bun",
+    "bench": "bun run scripts/bench/runner.ts",
+    "bench:baseline": "bun run scripts/bench/scenarios/1_baseline.ts"
   },
   "dependencies": {
     "@opentelemetry/api": "^1.9.0",
